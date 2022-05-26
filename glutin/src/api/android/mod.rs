@@ -1,18 +1,22 @@
 #![cfg(target_os = "android")]
 
-use crate::api::egl::{Context as EglContext, NativeDisplay, SurfaceType as EglSurfaceType};
-use crate::CreationError::{self, OsError};
-use crate::{Api, ContextError, GlAttributes, PixelFormat, PixelFormatRequirements, Rect};
+use std::sync::Arc;
+use std::thread;
 
-use crate::platform::android::EventLoopExtAndroid;
-use glutin_egl_sys as ffi;
+use ndk_glue::Event;
 use parking_lot::Mutex;
 use winit;
 use winit::dpi;
 use winit::event_loop::EventLoopWindowTarget;
 use winit::window::WindowBuilder;
 
-use std::sync::Arc;
+use glutin_egl_sys as ffi;
+
+use crate::{Api, ContextError, GlAttributes, PixelFormat, PixelFormatRequirements, Rect};
+use crate::api::egl::{Context as EglContext, NativeDisplay, SurfaceType as EglSurfaceType};
+use crate::CreationError::{self, OsError};
+
+// use crate::platform::android::EventLoopExtAndroid;
 
 #[derive(Debug)]
 struct AndroidContext {
@@ -23,29 +27,29 @@ struct AndroidContext {
 #[derive(Debug)]
 pub struct Context(Arc<AndroidContext>);
 
-#[derive(Debug)]
-struct AndroidSyncEventHandler(Arc<AndroidContext>);
-
-impl android_glue::SyncEventHandler for AndroidSyncEventHandler {
-    fn handle(&mut self, event: &android_glue::Event) {
-        match *event {
-            // 'on_surface_destroyed' Android event can arrive with some delay
-            // because multithreading communication. Because of
-            // that, swap_buffers can be called before processing
-            // 'on_surface_destroyed' event, with the native window
-            // surface already destroyed. EGL generates a BAD_SURFACE error in
-            // this situation. Set stop to true to prevent
-            // swap_buffer call race conditions.
-            android_glue::Event::TermWindow => {
-                let mut stopped = self.0.stopped.as_ref().unwrap().lock();
-                *stopped = true;
-            }
-            _ => {
-                return;
-            }
-        };
-    }
-}
+// #[derive(Debug)]
+// struct AndroidSyncEventHandler(Arc<AndroidContext>);
+//
+// impl android_glue::SyncEventHandler for AndroidSyncEventHandler {
+//     fn handle(&mut self, event: &android_glue::Event) {
+//         match *event {
+//             // 'on_surface_destroyed' Android event can arrive with some delay
+//             // because multithreading communication. Because of
+//             // that, swap_buffers can be called before processing
+//             // 'on_surface_destroyed' event, with the native window
+//             // surface already destroyed. EGL generates a BAD_SURFACE error in
+//             // this situation. Set stop to true to prevent
+//             // swap_buffer call race conditions.
+//             android_glue::Event::TermWindow => {
+//                 let mut stopped = self.0.stopped.as_ref().unwrap().lock();
+//                 *stopped = true;
+//             }
+//             _ => {
+//                 return;
+//             }
+//         };
+//     }
+// }
 
 impl Context {
     #[inline]
@@ -57,23 +61,70 @@ impl Context {
     ) -> Result<(winit::window::Window, Self), CreationError> {
         let win = wb.build(el)?;
         let gl_attr = gl_attr.clone().map_sharing(|c| &c.0.egl_context);
-        let nwin = unsafe { android_glue::get_native_window() };
-        if nwin.is_null() {
-            return Err(OsError("Android's native window is null".to_string()));
-        }
+        // let nwin = unsafe { android_glue::get_native_window() };
+        // if nwin.is_null() {
+        //     return Err(OsError("Android's native window is null".to_string()));
+        // }
+        let nwin = loop { // Wait for window created event
+            if let Some(evt) = ndk_glue::poll_events() {
+                match evt {
+                    Event::WindowCreated => {
+                        let nwin = ndk_glue::native_window();
+                        if nwin.is_none() {
+                            return Err(OsError("Android's native window is null".to_string()));
+                        }
+                        break nwin;
+                    }
+                    _ => eprintln!("Ignoring event: {:?}", evt)
+                }
+            }
+        };
         let native_display = NativeDisplay::Android;
         let egl_context =
             EglContext::new(pf_reqs, &gl_attr, native_display, EglSurfaceType::Window, |c, _| {
                 Ok(c[0])
-            })
-            .and_then(|p| p.finish(nwin as *const _))?;
+            }).and_then(|p| p.finish(nwin.as_ref().unwrap().ptr().as_ptr() as *const _))?;
+        // Android has started the activity or sent it to foreground.
+        // Restore the EGL surface and animation loop.
+        unsafe {
+            let nwin = nwin.as_ref().unwrap();
+            egl_context.on_surface_created(nwin.ptr().as_ptr() as *const _);
+        }
         let ctx = Arc::new(AndroidContext { egl_context, stopped: Some(Mutex::new(false)) });
-
-        let handler = Box::new(AndroidSyncEventHandler(ctx.clone()));
-        android_glue::add_sync_event_handler(handler);
         let context = Context(ctx.clone());
 
-        el.set_suspend_callback(Some(Box::new(move |suspended| {
+        thread::spawn(move || {
+            loop {
+                if let Some(evt) = ndk_glue::poll_events() {
+                    let mut stopped = ctx.stopped.as_ref().unwrap().lock();
+                    match evt {
+                        Event::Resume => {
+                            // Android has started the activity or sent it to foreground.
+                            // Restore the EGL surface and animation loop.
+                            unsafe {
+                                let nwin = ndk_glue::native_window();
+                                let nwin = nwin.as_ref().unwrap();
+                                ctx.egl_context.on_surface_created(nwin.ptr().as_ptr() as *const _);
+                            }
+                            *stopped = false;
+                        }
+                        Event::Stop | Event::Pause => {
+                            *stopped = true;
+                            // Android has stopped the activity or sent it to background.
+                            // Release the EGL surface and stop the animation loop.
+                            unsafe {
+                                ctx.egl_context.on_surface_destroyed();
+                            }
+                        }
+                        _ => eprintln!("HACK: unhandled event: {:?}", evt),
+                    }
+                }
+            }
+        });
+        // let handler = Box::new(AndroidSyncEventHandler(ctx.clone()));
+        // android_glue::add_sync_event_handler(handler);
+
+        /*el.set_suspend_callback(Some(Box::new(move |suspended| {
             let mut stopped = ctx.stopped.as_ref().unwrap().lock();
             *stopped = suspended;
             if suspended {
@@ -90,7 +141,7 @@ impl Context {
                     ctx.egl_context.on_surface_created(nwin as *const _);
                 }
             }
-        })));
+        })));*/
 
         Ok((win, context))
     }
@@ -141,6 +192,11 @@ impl Context {
 
     #[inline]
     pub fn resize(&self, _: u32, _: u32) {}
+
+    #[inline]
+    pub fn buffer_age(&self) -> u32 {
+        self.0.egl_context.buffer_age()
+    }
 
     #[inline]
     pub fn is_current(&self) -> bool {

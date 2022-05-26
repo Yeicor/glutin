@@ -618,7 +618,7 @@ impl Context {
     pub fn swap_buffers_with_damage(&self, rects: &[Rect]) -> Result<(), ContextError> {
         let egl = EGL.as_ref().unwrap();
 
-        if !egl.SwapBuffersWithDamageKHR.is_loaded() {
+        if !self.swap_buffers_with_damage_supported() {
             return Err(ContextError::FunctionUnavailable);
         }
 
@@ -658,10 +658,16 @@ impl Context {
     }
 
     #[inline]
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "android")))]
     pub fn swap_buffers_with_damage_supported(&self) -> bool {
         let egl = EGL.as_ref().unwrap();
         egl.SwapBuffersWithDamageKHR.is_loaded()
+    }
+
+    #[inline]
+    #[cfg(target_os = "android")]
+    pub fn swap_buffers_with_damage_supported(&self) -> bool {
+        true
     }
 
     #[inline]
